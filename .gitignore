@@ -2,19 +2,57 @@
 x64/
 NanoLLM/x64/
 
-*.user
+# Prerequisites
+*.d
+
+# Compiled object and intermediate files
+*.slo
+*.lo
+*.o
 *.obj
 *.iobj
-*.ipdb
 *.idb
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Linker files
 *.ilk
+
+# Debugger and debug information files
 *.pdb
+*.ipdb
+*.dwo
+
+# Compiled dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables and app bundles
 *.exe
+*.out
+*.app
+
+# Visual Studio user and build logs
+*.user
 *.log
 *.recipe
 *.tlog
 *.lastbuildstate
 
+# Generated sample artifacts
 bench_out
 bench_out.merges
 bench_out.voc
