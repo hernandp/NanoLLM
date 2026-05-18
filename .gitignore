@@ -1,4 +1,6 @@
 .vs/
+bin/
+build/
 x64/
 NanoLLM/x64/
 
@@ -53,24 +55,10 @@ NanoLLM/x64/
 *.lastbuildstate
 
 # Generated sample artifacts
-bench_out
-bench_out.merges
-bench_out.voc
-named_out.merges
-named_out.voc
-named_out_2.merges
-named_out_2.voc
-out
-out.lst
-out.merges
-out.voc
-encode_output.tok
-encode_stats_output.tok
-encode_test.merges
-encode_test.voc
-train_smoke_tok.merges
-train_smoke_tok.voc
-train_tiny_model.emb
-train_tiny_model.meta
-train_tiny_tok.merges
-train_tiny_tok.voc
+*.voc
+*.merges
+*.tok
+*.ids
+*.emb
+*.meta
+*.lst
