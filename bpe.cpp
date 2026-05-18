@@ -292,3 +292,43 @@ std::vector<std::string> EncodeWithMerges(
 
     return encodedTokens;
 }
+
+std::vector<std::size_t> TokenStringsToIds(
+    const std::vector<std::string>& tokens,
+    const std::vector<std::string>& vocabulary)
+{
+    std::unordered_map<std::string, std::size_t> tokenToId;
+    tokenToId.reserve(vocabulary.size());
+
+    for (std::size_t i = 0; i < vocabulary.size(); ++i)
+    {
+        tokenToId.emplace(vocabulary[i], i);
+    }
+
+    // Unknown tokens are skipped; with matching .voc/.merges files this should
+    // not happen for the current toy tokenizer.
+    std::vector<std::size_t> tokenIds;
+    tokenIds.reserve(tokens.size());
+
+    for (const std::string& token : tokens)
+    {
+        const auto it = tokenToId.find(token);
+        if (it != tokenToId.end())
+        {
+            tokenIds.push_back(it->second);
+        }
+    }
+
+    return tokenIds;
+}
+
+std::vector<std::size_t> EncodeWithMergesToIds(
+    std::string_view text,
+    const std::vector<std::string>& mergeRules,
+    const std::vector<std::string>& vocabulary)
+{
+    // Reuse the normal encoder first so token-id encoding cannot drift from
+    // the human-readable .tok output.
+    const std::vector<std::string> encodedTokens = EncodeWithMerges(text, mergeRules);
+    return TokenStringsToIds(encodedTokens, vocabulary);
+}

@@ -110,25 +110,35 @@ int RunSelfTests()
     const std::string vocabularyPath = basePath + ".voc";
     const std::string mergesPath = basePath + ".merges";
     const std::string tokensPath = basePath + ".tok";
+    const std::string tokenIdsPath = basePath + ".ids";
     const std::string embeddingPath = basePath + ".emb";
     const std::string metadataPath = basePath + ".meta";
 
     RemoveIfExists(vocabularyPath);
     RemoveIfExists(mergesPath);
     RemoveIfExists(tokensPath);
+    RemoveIfExists(tokenIdsPath);
     RemoveIfExists(embeddingPath);
     RemoveIfExists(metadataPath);
+
+    const std::vector<std::size_t> encodedTokenIds =
+        EncodeWithMergesToIds("lowest lower", trained.merges, trained.vocabulary);
 
     tests.Check(WriteVocabularyFile(vocabularyPath, trained), "WriteVocabularyFile.WritesFile", "Could not write vocabulary file");
     tests.Check(WriteMergeFile(mergesPath, trained), "WriteMergeFile.WritesFile", "Could not write merge file");
     tests.Check(WriteTokenFile(tokensPath, encoded), "WriteTokenFile.WritesFile", "Could not write token file");
+    tests.Check(WriteTokenIdFile(tokenIdsPath, encodedTokenIds), "WriteTokenIdFile.WritesFile", "Could not write token id file");
 
     std::vector<std::string> mergeLines;
+    std::vector<std::size_t> reloadedTokenIds;
     std::string tokenFileContents;
     tests.Check(ReadLines(mergesPath, mergeLines), "ReadLines.ReadsMergeFile", "Could not read merge file back");
     tests.Check(ReadWholeFile(tokensPath, tokenFileContents), "ReadWholeFile.ReadsTokenFile", "Could not read token file back");
+    tests.Check(ReadTokenIdFile(tokenIdsPath, reloadedTokenIds), "ReadTokenIdFile.ReadsTokenIdFile", "Could not read token id file back");
     tests.Check(mergeLines.size() == trained.merges.size(), "ReadLines.PreservesMergeCount", "Merge count changed after file round-trip");
     tests.Check(tokenFileContents.find(encoded.front()) != std::string::npos, "WriteTokenFile.PreservesTokenText", "Token file did not contain encoded tokens");
+    tests.Check(!encodedTokenIds.empty(), "EncodeWithMergesToIds.ProducesIds", "Expected token ids from encoded text");
+    tests.Check(reloadedTokenIds == encodedTokenIds, "ReadTokenIdFile.PreservesIds", "Token id file changed after round-trip");
 
     std::vector<std::string> reloadedVocabulary;
     tests.Check(LoadVocabularyFile(vocabularyPath, reloadedVocabulary), "LoadVocabularyFile.ReadsVocabulary", "Could not read vocabulary file back");
@@ -141,17 +151,23 @@ int RunSelfTests()
     options.negativeSamples = 2;
     options.learningRate = 0.05f;
     options.seed = 123;
+    options.showProgress = false;
 
     const EmbeddingTrainingResult trainingRun1 =
         TrainEmbeddings(corpus, trained.vocabulary, trained.merges, options);
     const EmbeddingTrainingResult trainingRun2 =
         TrainEmbeddings(corpus, trained.vocabulary, trained.merges, options);
+    const std::vector<std::size_t> corpusTokenIds =
+        EncodeWithMergesToIds(corpus, trained.merges, trained.vocabulary);
+    const EmbeddingTrainingResult trainingFromIds =
+        TrainEmbeddingsFromTokenIds(corpusTokenIds, trained.vocabulary, options);
 
     tests.Check(trainingRun1.tokenCount > 0, "TrainEmbeddings.CountsTokens", "Expected encoded training tokens");
     tests.Check(trainingRun1.vocabulary.size() == trained.vocabulary.size(), "TrainEmbeddings.KeepsVocabulary", "Embedding trainer changed vocabulary size");
     tests.Check(trainingRun1.embeddings.size() == trained.vocabulary.size(), "TrainEmbeddings.ProducesRowsPerToken", "Embedding row count mismatch");
     tests.Check(!trainingRun1.embeddings.empty() && trainingRun1.embeddings.front().size() == options.dimension, "TrainEmbeddings.UsesRequestedDimension", "Embedding dimension mismatch");
     tests.Check(trainingRun1.embeddings == trainingRun2.embeddings, "TrainEmbeddings.IsDeterministicWithFixedSeed", "Repeated runs with same seed should match");
+    tests.Check(trainingRun1.embeddings == trainingFromIds.embeddings, "TrainEmbeddingsFromTokenIds.MatchesRawTextPath", "Training from pre-tokenized ids should match raw text path");
 
     tests.Check(WriteEmbeddingFile(embeddingPath, trainingRun1), "WriteEmbeddingFile.WritesFile", "Could not write embedding file");
     tests.Check(
@@ -175,6 +191,7 @@ int RunSelfTests()
     RemoveIfExists(vocabularyPath);
     RemoveIfExists(mergesPath);
     RemoveIfExists(tokensPath);
+    RemoveIfExists(tokenIdsPath);
     RemoveIfExists(embeddingPath);
     RemoveIfExists(metadataPath);
 

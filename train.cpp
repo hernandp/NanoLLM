@@ -8,11 +8,12 @@
 #include "bpe.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <random>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace
@@ -133,42 +134,25 @@ void ApplyBinaryUpdate(
     }
 }
 
-// Count tokens in the encoded corpus so we can:
-//   - build training ids
-//   - estimate how often each token appears
-//   - create the negative-sampling distribution
-void BuildTokenIds(
-    std::string_view corpus,
-    const std::vector<std::string>& vocabulary,
-    const std::vector<std::string>& mergeRules,
-    std::vector<TokenId>& tokenIds,
-    std::vector<std::size_t>& tokenCounts)
+// Count token ids so we can build the negative-sampling distribution. Reusing
+// ids from a .ids file avoids running the BPE encoder again during /train.
+std::vector<std::size_t> CountTokenIds(
+    const std::vector<TokenId>& tokenIds,
+    std::size_t vocabularySize)
 {
-    std::unordered_map<std::string, TokenId> tokenToId;
-    tokenToId.reserve(vocabulary.size());
+    std::vector<std::size_t> tokenCounts(vocabularySize, 0);
 
-    for (TokenId i = 0; i < vocabulary.size(); ++i)
+    for (TokenId tokenId : tokenIds)
     {
-        tokenToId.emplace(vocabulary[i], i);
-    }
-
-    tokenIds.clear();
-    tokenCounts.assign(vocabulary.size(), 0);
-
-    const std::vector<std::string> encodedTokens = EncodeWithMerges(corpus, mergeRules);
-    tokenIds.reserve(encodedTokens.size());
-
-    for (const std::string& token : encodedTokens)
-    {
-        const auto it = tokenToId.find(token);
-        if (it == tokenToId.end())
+        if (tokenId >= vocabularySize)
         {
             continue;
         }
 
-        tokenIds.push_back(it->second);
-        ++tokenCounts[it->second];
+        ++tokenCounts[tokenId];
     }
+
+    return tokenCounts;
 }
 
 // word2vec-style negative sampling does not sample uniformly. Frequent tokens
@@ -211,6 +195,34 @@ std::vector<std::vector<float>> UnflattenEmbeddings(
 
     return result;
 }
+
+// Print coarse-grained progress so long training runs do not look stalled.
+// We update in chunks rather than every token because console IO is much slower
+// than the math itself and would otherwise dominate the runtime in this tiny trainer.
+void PrintTrainingProgress(
+    std::size_t epochIndex,
+    std::size_t epochCount,
+    std::size_t completedCenters,
+    std::size_t totalCenters,
+    const std::chrono::steady_clock::time_point& startTime)
+{
+    if (totalCenters == 0)
+    {
+        return;
+    }
+
+    const std::size_t percent = (completedCenters * 100) / totalCenters;
+    const auto elapsedMilliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+
+    std::cout << '\r'
+              << "Epoch " << (epochIndex + 1) << '/' << epochCount
+              << " - " << percent << "% - "
+              << completedCenters << '/' << totalCenters
+              << " center tokens - " << elapsedMilliseconds << " ms elapsed"
+              << std::flush;
+}
 }
 
 bool LoadVocabularyFile(const std::string& path, std::vector<std::string>& vocabulary)
@@ -224,6 +236,18 @@ EmbeddingTrainingResult TrainEmbeddings(
     const std::vector<std::string>& mergeRules,
     const TrainOptions& options)
 {
+    // Raw-text training is a convenience wrapper: tokenize once with the saved
+    // BPE rules, then train from the resulting numeric ids. The /train tokens=
+    // path below skips this encoding step by loading ids from disk directly.
+    const std::vector<TokenId> tokenIds = EncodeWithMergesToIds(corpus, mergeRules, vocabulary);
+    return TrainEmbeddingsFromTokenIds(tokenIds, vocabulary, options);
+}
+
+EmbeddingTrainingResult TrainEmbeddingsFromTokenIds(
+    const std::vector<std::size_t>& tokenIds,
+    const std::vector<std::string>& vocabulary,
+    const TrainOptions& options)
+{
     EmbeddingTrainingResult result;
     result.vocabulary = vocabulary;
     result.vocabularySizeUsed = vocabulary.size();
@@ -233,14 +257,23 @@ EmbeddingTrainingResult TrainEmbeddings(
         return result;
     }
 
-    // Step 1: turn raw text into the same BPE tokens used everywhere else in
-    // the project. This keeps /train aligned with /bpe and /encode.
-    std::vector<TokenId> tokenIds;
-    std::vector<std::size_t> tokenCounts;
-    BuildTokenIds(corpus, vocabulary, mergeRules, tokenIds, tokenCounts);
-    result.tokenCount = tokenIds.size();
+    // Step 1: accept the already-encoded token id stream. This is the compact
+    // representation the trainer actually needs: each number is a row index in
+    // the vocabulary/embedding table. Invalid ids are ignored so a hand-edited
+    // .ids file cannot make the trainer index past the embedding matrix.
+    std::vector<TokenId> trainingTokenIds;
+    trainingTokenIds.reserve(tokenIds.size());
+    for (TokenId tokenId : tokenIds)
+    {
+        if (tokenId < vocabulary.size())
+        {
+            trainingTokenIds.push_back(tokenId);
+        }
+    }
 
-    if (tokenIds.empty())
+    result.tokenCount = trainingTokenIds.size();
+
+    if (trainingTokenIds.empty())
     {
         result.embeddings.assign(vocabulary.size(), std::vector<float>(options.dimension, 0.0f));
         return result;
@@ -268,6 +301,7 @@ EmbeddingTrainingResult TrainEmbeddings(
     }
 
     // Step 3: create the negative-sampling distribution from token counts.
+    const std::vector<std::size_t> tokenCounts = CountTokenIds(trainingTokenIds, vocabulary.size());
     const std::vector<double> negativeWeights = BuildNegativeSamplingWeights(tokenCounts);
     std::discrete_distribution<std::size_t> negativeSampler(
         negativeWeights.begin(),
@@ -276,16 +310,24 @@ EmbeddingTrainingResult TrainEmbeddings(
     // Step 4: walk the token stream and generate skip-gram training pairs.
     // For each center token, nearby tokens inside the window are positive
     // examples. Each positive example is paired with several random negatives.
+    const auto trainingStartTime = std::chrono::steady_clock::now();
     for (std::size_t epoch = 0; epoch < options.epochs; ++epoch)
     {
-        for (std::size_t centerIndex = 0; centerIndex < tokenIds.size(); ++centerIndex)
+        if (options.showProgress)
         {
-            const TokenId centerId = tokenIds[centerIndex];
+            std::cout << "Starting epoch " << (epoch + 1)
+                      << '/' << options.epochs << '\n';
+        }
+
+        const std::size_t progressStep = std::max<std::size_t>(1, trainingTokenIds.size() / 100);
+        for (std::size_t centerIndex = 0; centerIndex < trainingTokenIds.size(); ++centerIndex)
+        {
+            const TokenId centerId = trainingTokenIds[centerIndex];
 
             const std::size_t begin =
                 (centerIndex > options.window) ? centerIndex - options.window : 0;
             const std::size_t end =
-                std::min(tokenIds.size(), centerIndex + options.window + 1);
+                std::min(trainingTokenIds.size(), centerIndex + options.window + 1);
 
             for (std::size_t contextIndex = begin; contextIndex < end; ++contextIndex)
             {
@@ -294,7 +336,7 @@ EmbeddingTrainingResult TrainEmbeddings(
                     continue;
                 }
 
-                const TokenId contextId = tokenIds[contextIndex];
+                const TokenId contextId = trainingTokenIds[contextIndex];
 
                 // Positive pair: center token should predict the real context.
                 ApplyBinaryUpdate(
@@ -329,6 +371,26 @@ EmbeddingTrainingResult TrainEmbeddings(
                         options.learningRate);
                 }
             }
+
+            if (options.showProgress)
+            {
+                const std::size_t completedCenters = centerIndex + 1;
+                if (completedCenters == trainingTokenIds.size() ||
+                    (completedCenters % progressStep) == 0)
+                {
+                    PrintTrainingProgress(
+                        epoch,
+                        options.epochs,
+                        completedCenters,
+                        trainingTokenIds.size(),
+                        trainingStartTime);
+                }
+            }
+        }
+
+        if (options.showProgress)
+        {
+            std::cout << '\n';
         }
     }
 

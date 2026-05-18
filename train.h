@@ -18,6 +18,7 @@ struct TrainOptions
     std::size_t negativeSamples = 5;
     float learningRate = 0.025f;
     std::uint32_t seed = 1;
+    bool showProgress = true;
 };
 
 // The in-memory result of training. The embedding matrix is stored row-major:
@@ -36,6 +37,10 @@ EmbeddingTrainingResult TrainEmbeddings(
     std::string_view corpus,
     const std::vector<std::string>& vocabulary,
     const std::vector<std::string>& mergeRules,
+    const TrainOptions& options);
+EmbeddingTrainingResult TrainEmbeddingsFromTokenIds(
+    const std::vector<std::size_t>& tokenIds,
+    const std::vector<std::string>& vocabulary,
     const TrainOptions& options);
 
 bool WriteEmbeddingFile(const std::string& path, const EmbeddingTrainingResult& result);

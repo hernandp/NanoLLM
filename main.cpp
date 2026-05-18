@@ -54,16 +54,18 @@ void PrintHelp(std::string_view programName)
         << "/encode mergefile=b     Encode text using merge file b.merges.\n"
         << "                        Optional input=i reads from file i, otherwise stdin is used\n"
         << "                        until EOF. Optional output=o writes to o.tok, otherwise the\n"
-        << "                        encoded tokens are printed. Example:\n"
+        << "                        encoded tokens are printed. Optional ids=t writes t.ids\n"
+        << "                        with numeric token ids for faster training. Example:\n"
         << "                       " << programName
-        << " /encode mergefile=vocab input=text.txt output=encoded\n"
+        << " /encode mergefile=vocab input=text.txt output=encoded ids=encoded\n"
         << "/train mergefile=b      Train token embeddings using tokenizer b.voc/b.merges.\n"
-        << "       input=i          Source corpus text file\n"
+        << "       input=i          Source corpus text file, tokenized during training\n"
+        << "       tokens=t         Existing t.ids token-id file, skips BPE tokenization\n"
         << "       output=o         Writes o.emb and o.meta\n"
         << "       [dim=64] [window=4] [epochs=3] [neg=5] [lr=0.025] [seed=1]\n"
         << "                        Example:\n"
         << "                       " << programName
-        << " /train mergefile=vocab input=corpus.txt output=model dim=64 epochs=3\n"
+        << " /train mergefile=vocab tokens=encoded output=model dim=64 epochs=3\n"
         << "/selftest               Run built-in tests for critical functionality\n";
 }
 
@@ -153,6 +155,27 @@ bool ReadLines(const std::string& path, std::vector<std::string>& lines)
     return true;
 }
 
+bool ReadTokenIdFile(const std::string& path, std::vector<std::size_t>& tokenIds)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+    {
+        return false;
+    }
+
+    tokenIds.clear();
+    std::size_t tokenId = 0;
+    while (input >> tokenId)
+    {
+        tokenIds.push_back(tokenId);
+    }
+
+    // If extraction stopped for something other than EOF, the file contains a
+    // malformed token id. Treat that as a read failure instead of silently
+    // training from a truncated stream.
+    return input.eof();
+}
+
 bool WriteVocabularyFile(const std::string& path, const BPEResult& result)
 {
     std::ofstream output(path, std::ios::binary);
@@ -209,6 +232,31 @@ bool WriteTokenFile(const std::string& path, const std::vector<std::string>& tok
     return static_cast<bool>(output);
 }
 
+bool WriteTokenIdFile(const std::string& path, const std::vector<std::size_t>& tokenIds)
+{
+    std::ofstream output(path, std::ios::binary);
+    if (!output)
+    {
+        return false;
+    }
+
+    // The .ids format is intentionally simple: whitespace-separated numeric
+    // vocabulary row indexes. It is compact enough for toy experiments and easy
+    // to inspect or generate by hand.
+    for (std::size_t i = 0; i < tokenIds.size(); ++i)
+    {
+        if (i != 0)
+        {
+            output << ' ';
+        }
+
+        output << tokenIds[i];
+    }
+
+    output << '\n';
+    return static_cast<bool>(output);
+}
+
 void PrintTokens(const std::vector<std::string>& tokens)
 {
     for (std::size_t i = 0; i < tokens.size(); ++i)
@@ -222,6 +270,16 @@ void PrintTokens(const std::vector<std::string>& tokens)
     }
 
     std::cout << '\n';
+}
+
+std::string WithDefaultExtension(const std::string& baseOrPath, std::string_view extension)
+{
+    if (baseOrPath.ends_with(extension))
+    {
+        return baseOrPath;
+    }
+
+    return baseOrPath + std::string(extension);
 }
 
 int main(int argc, char* argv[])
@@ -256,9 +314,12 @@ int main(int argc, char* argv[])
     if (command == "/bpe")
     {
         NamedArgumentMap arguments;
-        if (!TryParseNamedArguments(argc, argv, 2, arguments))
+        const std::string bpeUsage =
+            "Usage: " + std::string(programName) + " /bpe src=<file> out=<base-name> m=<target-size>\n";
+
+        if (argc == 2 || !TryParseNamedArguments(argc, argv, 2, arguments))
         {
-            std::cerr << "Usage: " << programName << " /bpe src=<file> out=<base-name> m=<target-size>\n";
+            std::cerr << bpeUsage;
             return 1;
         }
 
@@ -326,10 +387,13 @@ int main(int argc, char* argv[])
     if (command == "/encode")
     {
         NamedArgumentMap arguments;
-        if (!TryParseNamedArguments(argc, argv, 2, arguments))
+        const std::string encodeUsage =
+            "Usage: " + std::string(programName) +
+            " /encode mergefile=<base-name> [input=<file>] [output=<base-name>] [ids=<base-name>]\n";
+
+        if (argc == 2 || !TryParseNamedArguments(argc, argv, 2, arguments))
         {
-            std::cerr << "Usage: " << programName
-                      << " /encode mergefile=<base-name> [input=<file>] [output=<base-name>]\n";
+            std::cerr << encodeUsage;
             return 1;
         }
 
@@ -340,16 +404,16 @@ int main(int argc, char* argv[])
             return 1;
         }
 
-        if (arguments.size() < 1 || arguments.size() > 3)
+        if (arguments.size() < 1 || arguments.size() > 4)
         {
-            std::cerr << "Unknown /encode argument detected. Expected mergefile=..., optional input=..., optional output=...\n";
+            std::cerr << "Unknown /encode argument detected. Expected mergefile=..., optional input=..., optional output=..., optional ids=...\n";
             return 1;
         }
 
         for (const auto& [key, value] : arguments)
         {
             (void)value;
-            if (key != "mergefile" && key != "input" && key != "output")
+            if (key != "mergefile" && key != "input" && key != "output" && key != "ids")
             {
                 std::cerr << "Unknown /encode argument: " << key << '\n';
                 return 1;
@@ -381,6 +445,21 @@ int main(int argc, char* argv[])
 
         const auto startTime = std::chrono::steady_clock::now();
         const auto encodedTokens = EncodeWithMerges(inputText, mergeRules);
+        std::vector<std::size_t> encodedTokenIds;
+        const auto idsIt = arguments.find("ids");
+        if (idsIt != arguments.end())
+        {
+            std::vector<std::string> vocabulary;
+            const std::string vocabularyPath = mergeFileIt->second + ".voc";
+            if (!LoadVocabularyFile(vocabularyPath, vocabulary))
+            {
+                std::cerr << "Could not open vocabulary file: " << vocabularyPath << '\n';
+                return 1;
+            }
+
+            encodedTokenIds = TokenStringsToIds(encodedTokens, vocabulary);
+        }
+
         const auto endTime = std::chrono::steady_clock::now();
         const auto elapsedMilliseconds =
             std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -406,34 +485,58 @@ int main(int argc, char* argv[])
                       << " encoded tokens in " << elapsedMilliseconds.count() << " ms\n";
         }
 
+        if (idsIt != arguments.end())
+        {
+            const std::string idsPath = WithDefaultExtension(idsIt->second, ".ids");
+            if (!WriteTokenIdFile(idsPath, encodedTokenIds))
+            {
+                std::cerr << "Could not write token id file: " << idsPath << '\n';
+                return 1;
+            }
+
+            std::cout << "Wrote " << encodedTokenIds.size()
+                      << " token ids to " << idsPath << '\n';
+        }
+
         return 0;
     }
 
     if (command == "/train")
     {
         NamedArgumentMap arguments;
-        if (!TryParseNamedArguments(argc, argv, 2, arguments))
+        const std::string trainUsage =
+            "Usage: " + std::string(programName) +
+            " /train mergefile=<base-name> output=<base-name> (input=<file> | tokens=<base-name-or-file>)"
+            " [dim=<n>] [window=<n>] [epochs=<n>] [neg=<n>] [lr=<f>] [seed=<n>]\n";
+
+        if (argc == 2 || !TryParseNamedArguments(argc, argv, 2, arguments))
         {
-            std::cerr << "Usage: " << programName
-                      << " /train mergefile=<base-name> input=<file> output=<base-name>"
-                      << " [dim=<n>] [window=<n>] [epochs=<n>] [neg=<n>] [lr=<f>] [seed=<n>]\n";
+            std::cerr << trainUsage;
             return 1;
         }
 
         const auto mergeFileIt = arguments.find("mergefile");
         const auto inputIt = arguments.find("input");
+        const auto tokensIt = arguments.find("tokens");
         const auto outputIt = arguments.find("output");
 
-        if (mergeFileIt == arguments.end() || inputIt == arguments.end() || outputIt == arguments.end())
+        if (mergeFileIt == arguments.end() || outputIt == arguments.end() ||
+            (inputIt == arguments.end() && tokensIt == arguments.end()))
         {
-            std::cerr << "Missing required /train arguments. Expected mergefile=..., input=..., and output=...\n";
+            std::cerr << trainUsage;
+            return 1;
+        }
+
+        if (inputIt != arguments.end() && tokensIt != arguments.end())
+        {
+            std::cerr << "Use either input=... or tokens=... for /train, not both.\n";
             return 1;
         }
 
         for (const auto& [key, value] : arguments)
         {
             (void)value;
-            if (key != "mergefile" && key != "input" && key != "output" &&
+            if (key != "mergefile" && key != "input" && key != "tokens" && key != "output" &&
                 key != "dim" && key != "window" && key != "epochs" &&
                 key != "neg" && key != "lr" && key != "seed")
             {
@@ -510,22 +613,42 @@ int main(int argc, char* argv[])
             return 1;
         }
 
-        std::vector<std::string> mergeRules;
-        if (!ReadLines(mergePath, mergeRules))
-        {
-            std::cerr << "Could not open merge file: " << mergePath << '\n';
-            return 1;
-        }
-
-        std::string corpus;
-        if (!ReadWholeFile(inputIt->second, corpus))
-        {
-            std::cerr << "Could not open source corpus file: " << inputIt->second << '\n';
-            return 1;
-        }
-
         const auto startTime = std::chrono::steady_clock::now();
-        const EmbeddingTrainingResult result = TrainEmbeddings(corpus, vocabulary, mergeRules, options);
+        EmbeddingTrainingResult result;
+        std::string trainingSourcePath;
+
+        if (tokensIt != arguments.end())
+        {
+            std::vector<std::size_t> tokenIds;
+            trainingSourcePath = WithDefaultExtension(tokensIt->second, ".ids");
+            if (!ReadTokenIdFile(trainingSourcePath, tokenIds))
+            {
+                std::cerr << "Could not read token id file: " << trainingSourcePath << '\n';
+                return 1;
+            }
+
+            result = TrainEmbeddingsFromTokenIds(tokenIds, vocabulary, options);
+        }
+        else
+        {
+            std::vector<std::string> mergeRules;
+            if (!ReadLines(mergePath, mergeRules))
+            {
+                std::cerr << "Could not open merge file: " << mergePath << '\n';
+                return 1;
+            }
+
+            std::string corpus;
+            trainingSourcePath = inputIt->second;
+            if (!ReadWholeFile(trainingSourcePath, corpus))
+            {
+                std::cerr << "Could not open source corpus file: " << trainingSourcePath << '\n';
+                return 1;
+            }
+
+            result = TrainEmbeddings(corpus, vocabulary, mergeRules, options);
+        }
+
         const auto endTime = std::chrono::steady_clock::now();
         const auto elapsedMilliseconds =
             std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
@@ -541,7 +664,7 @@ int main(int argc, char* argv[])
                 result,
                 options,
                 tokenizerBase,
-                inputIt->second,
+                trainingSourcePath,
                 elapsedMilliseconds))
         {
             std::cerr << "Could not write embedding metadata file: " << metadataPath << '\n';
